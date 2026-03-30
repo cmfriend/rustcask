@@ -8,21 +8,20 @@ This project is meant for educational use only.  It is not intended for producti
 
 This project is under the MIT license.
 
-## Not Implemented Yet
+## Features To Be Implemented
 
-The following features mentioned in the Bitcask paper are not yet implemented.  As they are implemented this section will be updated.
-
-- Hint files
-- Startup KeyDir rebuilding
-- Concurrent access
-- CRC validation
-
-## Future Plans
-
-The following features are planned for future implementation, not from the Bitcask paper.
-
-- Operations to query over a sorted range of keys.  This requires switching the keydir implementation to a BTreeMap.
-- TCP connectivity, to allow the database to run as a server and accept commands from a client over a network connection
+| Feature | Implemented? |
+| --- | --- |
+| REPL for testing | Yes |
+| Append Only Log Structured Storage | No |
+| CRC Validation | No |
+| Startup KeyDir rebuilding | No |
+| Log Compaction | No |
+| Hint files | No |
+| Concurrent access | No |
+| Range Queries over keys | No |
+| TCP connectivity (client/server mode) | No |
+| REPL improvement with rustyline crate | No |
 
 ## Overall Structure
 
@@ -134,4 +133,18 @@ The following environment variables provide configuration values for the databas
 
 #### Optional Environment Variables
 
-`RUSTCASK_MAX_FILE_SIZE` - The maximum file size cap, in MB.  Defaults to 4 MB if not present.
+`RUSTCASK_MAX_FILE_SIZE_MB` - The maximum file size cap, in MB.  Defaults to 4 MB if not present.
+
+## Running the Application
+
+First, configure a local `.env` file to contain the following environment variables:
+
+```
+RUSTCASK_FILE_PATH=<absolute path to file storage for database data>
+RUSTCASK_MAX_FILE_SIZE_MB=<integer file size, in MB>
+RUST_LOG=<log level>
+```
+
+Run the application with `cargo run --features mock` to use the mock in-memory database for testing purposes.
+
+Run the application with `cargo run` to use the regular filesystem database.
