@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct Settings {
-    file_path: PathBuf,
-    max_file_size: u8, // Max file size in MB, defaults to 4 MB
+    pub file_path: PathBuf,
+    pub max_file_size: u8, // Max file size in MB, defaults to 4 MB
 }
 
 impl Settings {

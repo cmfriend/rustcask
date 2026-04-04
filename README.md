@@ -13,7 +13,8 @@ This project is under the MIT license.
 | Feature | Implemented? |
 | --- | --- |
 | REPL for testing | Yes |
-| Append Only Log Structured Storage | No |
+| Append Only Log Structured Storage | Yes |
+| Log Rotation | No |
 | CRC Validation | No |
 | Startup KeyDir rebuilding | No |
 | Log Compaction | No |
@@ -33,7 +34,7 @@ Note that at runtime the entire keyspace is maintained in memory so enough memor
 
 The data on disk is organized into files with a capped size that is configurable using the environment variables listed below.  Files are rotated as they reach this size.
 
-The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of seconds since epoch.  The file currently being written is named `rustcask-active`.
+The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of seconds since epoch.  The file currently being written is named `0`.
 
 ## Binary Entry File Format
 
@@ -54,7 +55,7 @@ For instance, for version 1:
 ### Entry Format
 
 ```
-| crc (4 bytes) | timestamp in seconds since epoch (4 bytes) | key_size (4 bytes) | value_size (4 bytes) | flags (1 byte) | key (variable) | value (variable) |
+| crc (4 bytes) | timestamp in milliseconds since epoch (8 bytes) | key_size (4 bytes) | value_size (4 bytes) | flags (1 byte) | key (variable) | value (variable) |
 ```
 
 Maximum allowed key and value sizes are therefore 4GiB.  All numeric fields are little endian.
@@ -120,7 +121,7 @@ baz
 > get foo
 > get test
 123
-<ctrl-c> to end session
+> exit
 ```
 
 ### Environment Variable Configuration

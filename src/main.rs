@@ -5,7 +5,7 @@ mod mock_database;
 mod rustcask_database;
 mod settings;
 
-use database::Database;
+use database::{Database, Error};
 use dotenv::dotenv;
 #[cfg(feature = "mock")]
 use mock_database::*;
@@ -26,6 +26,7 @@ enum ReplError {
     FlushError(std::io::Error),
     ParseError(std::string::FromUtf8Error),
     SettingsError(String),
+    DatabaseError(Error),
 }
 
 fn main() -> Result<(), ReplError> {
@@ -33,20 +34,18 @@ fn main() -> Result<(), ReplError> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("rustcask=debug".parse().unwrap()),
-            )
-            .init();
+            EnvFilter::from_default_env().add_directive("rustcask=debug".parse().unwrap()),
+        )
+        .init();
 
     let settings = load_settings()?;
 
     tracing::debug!(?settings, "loaded settings");
 
-    // Build database instance
     #[cfg(feature = "mock")]
-    let db = MockDatabase::new();
-     #[cfg(not(feature = "mock"))]
-    let db = RustcaskDatabase::new();
+    let db = MockDatabase::open();
+    #[cfg(not(feature = "mock"))]
+    let db = RustcaskDatabase::open(settings.file_path).map_err(|e| ReplError::DatabaseError(e))?;
 
     cmd_loop(db)
 }
@@ -77,13 +76,11 @@ fn load_settings() -> Result<Settings, ReplError> {
 fn cmd_loop(mut db: impl Database) -> Result<(), ReplError> {
     tracing::info!("starting REPL");
 
-    // Enter CLI loop, use ctrl-c to exit
-    println!("Rustcask REPL.  Press Ctrl-C to exit.");
+    // Enter CLI loop
+    println!("Rustcask REPL.  Enter 'exit' to exit.");
     loop {
         print!("> ");
-        io::stdout()
-            .flush()
-            .map_err(|e| ReplError::FlushError(e))?; // exit on flush error
+        io::stdout().flush().map_err(|e| ReplError::FlushError(e))?; // exit on flush error
 
         // Wait for input up to /n
         let mut input = String::new();
@@ -124,9 +121,7 @@ fn cmd_loop(mut db: impl Database) -> Result<(), ReplError> {
 
                 match db.get(key) {
                     Ok(v) => {
-                        let s =
-                            String::from_utf8(v)
-                                .map_err(|e| ReplError::ParseError(e))?;
+                        let s = String::from_utf8(v).map_err(|e| ReplError::ParseError(e))?;
                         println!("{s}");
                     }
                     Err(database::Error::KeyMissing) => {
@@ -161,6 +156,11 @@ fn cmd_loop(mut db: impl Database) -> Result<(), ReplError> {
                 if let Err(e) = db.delete(key) {
                     tracing::error!(?e, "delete failed")
                 }
+            }
+            "exit" => {
+                // Ignore the rest of the input line and assume the user wants to exit
+
+                return Ok(());
             }
             _ => {
                 tracing::warn!("Invalid input: {input}");
