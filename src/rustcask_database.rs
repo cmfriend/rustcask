@@ -106,12 +106,13 @@ struct KeySize(u32);
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Flags(u8); // TODO: use bitflags crate
 
-const FILE_ENTRY_HEADER_SIZE: usize = std::mem::size_of::<Crc>()
+const FILE_ENTRY_HEADER_SERIALIZED_SIZE: usize = std::mem::size_of::<Crc>()
     + std::mem::size_of::<Timestamp>()
     + std::mem::size_of::<KeySize>()
     + std::mem::size_of::<ValueSize>()
     + std::mem::size_of::<Flags>();
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct FileEntryHeader {
     crc: Crc,
     timestamp: Timestamp,
@@ -122,7 +123,7 @@ struct FileEntryHeader {
 
 impl FileEntryHeader {
     fn serialize(&self) -> Vec<u8> {
-        let mut buffer = Vec::with_capacity(FILE_ENTRY_HEADER_SIZE);
+        let mut buffer = Vec::with_capacity(FILE_ENTRY_HEADER_SERIALIZED_SIZE);
 
         buffer.extend_from_slice(&self.crc.0.to_le_bytes());
         buffer.extend_from_slice(&self.timestamp.0.to_le_bytes());
@@ -207,7 +208,7 @@ impl Database for RustcaskDatabase {
         let _ = self.writer.write_all(&buffer)?;
         let _ = self.writer.flush()?;
 
-        let value_position = position + FILE_ENTRY_HEADER_SIZE as u64 + key.len() as u64;
+        let value_position = position + FILE_ENTRY_HEADER_SERIALIZED_SIZE as u64 + key.len() as u64;
 
         let _ = self.keydir.insert(
             Vec::from(key),
@@ -391,7 +392,7 @@ mod tests {
         let flags = 0u8;
 
         let mut target_buffer =
-            Vec::with_capacity(std::mem::size_of::<FileEntryHeader>() + key.len() + value.len());
+            Vec::with_capacity(FILE_ENTRY_HEADER_SERIALIZED_SIZE + key.len() + value.len());
 
         target_buffer.extend_from_slice(&crc.to_le_bytes());
         target_buffer.extend_from_slice(&timestamp.0.to_le_bytes());
