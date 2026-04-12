@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::database::*;
@@ -10,17 +10,17 @@ use crate::database::*;
 const ACTIVE_FILE_NAME: &str = "0";
 const ACTIVE_FILE_NAME_ID: u32 = 0u32;
 
-const FILE_HEADER_IDENTIFIER: &[u8] = b"rustcask";
-const FILE_HEADER_VERSION: &[u8] = &[0x01, 0x00];
-const FILE_HEADER_RESERVED: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-const FILE_HEADER_SIZE: usize =
-    FILE_HEADER_IDENTIFIER.len() + FILE_HEADER_VERSION.len() + FILE_HEADER_RESERVED.len();
-
-const ENTRY_HEADER_SIZE: usize = std::mem::size_of::<u32>()
-    + std::mem::size_of::<u64>()
-    + std::mem::size_of::<u32>()
-    + std::mem::size_of::<u32>()
-    + std::mem::size_of::<u8>();
+const FILE_HEADER_IDENTIFIER_BYTES: &[u8] = b"rustcask";
+const FILE_HEADER_VERSION_BYTES: &[u8] = &[0x01, 0x00];
+const FILE_HEADER_RESERVED_BYTES: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const FILE_HEADER_SIZE: usize = FILE_HEADER_IDENTIFIER_BYTES.len()
+    + FILE_HEADER_VERSION_BYTES.len()
+    + FILE_HEADER_RESERVED_BYTES.len();
+const FILE_HEADER_IDENTIFIER_BYTES_OFFSET: usize = 0;
+const FILE_HEADER_VERSION_BYTES_OFFSET: usize =
+    FILE_HEADER_IDENTIFIER_BYTES_OFFSET + FILE_HEADER_IDENTIFIER_BYTES.len();
+const FILE_HEADER_RESERVED_BYTES_OFFSET: usize =
+    FILE_HEADER_VERSION_BYTES_OFFSET + FILE_HEADER_VERSION_BYTES.len();
 
 pub struct RustcaskDatabase {
     reader: BufReader<File>,
@@ -28,19 +28,20 @@ pub struct RustcaskDatabase {
     keydir: HashMap<Vec<u8>, KeyDirEntry>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct FileId(u32);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct ValuePosition(u64);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct ValueSize(u32);
 
-#[derive(Debug, Clone, Copy)]
+// timestamp in milliseconds since unix epoch
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Timestamp(u64);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct KeyDirEntry {
     file_id: FileId, // name of the file in the data directory, timestamp seconds since epoch, or zero for the currently active file
     value_position: ValuePosition, // byte offset position within file
@@ -48,21 +49,27 @@ struct KeyDirEntry {
     timestamp: Timestamp, // timestamp when entry was written in milliseconds since epoch
 }
 
-struct Header {
-    version: u16,
-    reserved: [u8; 6],
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileHeaderVersion(u16);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileHeaderReserved([u8; FILE_HEADER_RESERVED_BYTES.len()]);
+
+struct FileHeader {
+    version: FileHeaderVersion,
+    reserved: FileHeaderReserved,
 }
 
 fn write_header(writer: &mut impl Write) -> Result<(), Error> {
-    writer.write_all(FILE_HEADER_IDENTIFIER)?;
-    writer.write_all(FILE_HEADER_VERSION)?;
-    writer.write_all(FILE_HEADER_RESERVED)?;
+    writer.write_all(FILE_HEADER_IDENTIFIER_BYTES)?;
+    writer.write_all(FILE_HEADER_VERSION_BYTES)?;
+    writer.write_all(FILE_HEADER_RESERVED_BYTES)?;
     writer.flush()?;
 
     Ok(())
 }
 
-fn parse_header<R: Read + Seek>(r: &mut R) -> Result<Header, Error> {
+fn parse_file_header<R: Read + Seek>(r: &mut R) -> Result<FileHeader, Error> {
     let mut buf = [0u8; FILE_HEADER_SIZE];
     let _ = r.read_exact(&mut buf).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -73,20 +80,57 @@ fn parse_header<R: Read + Seek>(r: &mut R) -> Result<Header, Error> {
     })?;
     let _ = r.rewind()?;
 
-    let identifier = &buf[0..8];
-    let version = &buf[8..10];
-    let reserved = &buf[10..16];
+    let identifier = &buf[FILE_HEADER_IDENTIFIER_BYTES_OFFSET..FILE_HEADER_VERSION_BYTES_OFFSET];
+    let version = &buf[FILE_HEADER_VERSION_BYTES_OFFSET..FILE_HEADER_RESERVED_BYTES_OFFSET];
+    let reserved = &buf[FILE_HEADER_RESERVED_BYTES_OFFSET..FILE_HEADER_SIZE];
 
-    if identifier == FILE_HEADER_IDENTIFIER
-        && version == FILE_HEADER_VERSION
-        && reserved == FILE_HEADER_RESERVED
+    if identifier == FILE_HEADER_IDENTIFIER_BYTES
+        && version == FILE_HEADER_VERSION_BYTES
+        && reserved == FILE_HEADER_RESERVED_BYTES
     {
-        Ok(Header {
-            version: u16::from_le_bytes(version.try_into().unwrap()),
-            reserved: reserved.try_into().unwrap(),
+        Ok(FileHeader {
+            version: FileHeaderVersion(u16::from_le_bytes(version.try_into().unwrap())),
+            reserved: FileHeaderReserved(reserved.try_into().unwrap()),
         })
     } else {
         Err(Error::InvalidHeader)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct Crc(u32);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct KeySize(u32);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct Flags(u8); // TODO: use bitflags crate
+
+const FILE_ENTRY_HEADER_SIZE: usize = std::mem::size_of::<Crc>()
+    + std::mem::size_of::<Timestamp>()
+    + std::mem::size_of::<KeySize>()
+    + std::mem::size_of::<ValueSize>()
+    + std::mem::size_of::<Flags>();
+
+struct FileEntryHeader {
+    crc: Crc,
+    timestamp: Timestamp,
+    key_size: KeySize,
+    value_size: ValueSize,
+    flags: Flags,
+}
+
+impl FileEntryHeader {
+    fn serialize(&self) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(FILE_ENTRY_HEADER_SIZE);
+
+        buffer.extend_from_slice(&self.crc.0.to_le_bytes());
+        buffer.extend_from_slice(&self.timestamp.0.to_le_bytes());
+        buffer.extend_from_slice(&self.key_size.0.to_le_bytes());
+        buffer.extend_from_slice(&self.value_size.0.to_le_bytes());
+        buffer.extend_from_slice(&self.flags.0.to_le_bytes());
+
+        buffer
     }
 }
 
@@ -96,19 +140,15 @@ fn build_file_entry_buffer(key: &[u8], value: &[u8], timestamp: Timestamp) -> Ve
     hasher.update(value);
     let crc = hasher.finalize();
 
-    let key_size = key.len() as u32;
+    let file_entry_header = FileEntryHeader {
+        crc: Crc(crc),
+        timestamp,
+        key_size: KeySize(key.len() as u32),
+        value_size: ValueSize(value.len() as u32),
+        flags: Flags(if value.is_empty() { 1u8 } else { 0u8 }),
+    };
 
-    let value_size = value.len() as u32;
-
-    let flags = if value.is_empty() { 1u8 } else { 0u8 }; // TODO: use bitflags crate
-
-    let mut buffer = Vec::with_capacity(ENTRY_HEADER_SIZE + key.len() + value.len());
-
-    buffer.extend_from_slice(&crc.to_le_bytes());
-    buffer.extend_from_slice(&timestamp.0.to_le_bytes());
-    buffer.extend_from_slice(&key_size.to_le_bytes());
-    buffer.extend_from_slice(&value_size.to_le_bytes());
-    buffer.extend_from_slice(&flags.to_le_bytes());
+    let mut buffer = file_entry_header.serialize();
     buffer.extend_from_slice(key);
     buffer.extend_from_slice(value);
 
@@ -167,7 +207,7 @@ impl Database for RustcaskDatabase {
         let _ = self.writer.write_all(&buffer)?;
         let _ = self.writer.flush()?;
 
-        let value_position = position + ENTRY_HEADER_SIZE as u64 + key.len() as u64;
+        let value_position = position + FILE_ENTRY_HEADER_SIZE as u64 + key.len() as u64;
 
         let _ = self.keydir.insert(
             Vec::from(key),
@@ -210,6 +250,43 @@ impl Database for RustcaskDatabase {
 }
 
 impl RustcaskDatabase {
+    fn build_database(active_file_path: PathBuf) -> Result<Self, Error> {
+        let exists = active_file_path.exists();
+
+        let mut read_file = OpenOptions::new()
+            .create(!active_file_path.exists())
+            .read(true)
+            .truncate(false)
+            .append(true)
+            .open(&active_file_path)?;
+
+        let mut write_file = OpenOptions::new()
+            .create(!active_file_path.exists())
+            .read(true)
+            .truncate(false)
+            .append(true)
+            .open(&active_file_path)?;
+
+        if exists {
+            // Check that the header is valid
+            let _ = parse_file_header(&mut read_file)?;
+
+            // TODO: Rebuild self.keydir from existing log files
+        } else {
+            let _ = write_header(&mut write_file)?;
+        }
+
+        let reader = BufReader::new(read_file);
+
+        let writer = BufWriter::new(write_file);
+
+        Ok(Self {
+            reader: reader,
+            writer: writer,
+            keydir: HashMap::new(),
+        })
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
 
@@ -229,65 +306,7 @@ impl RustcaskDatabase {
 
         let active_file_path = path.join(ACTIVE_FILE_NAME);
 
-        if active_file_path.exists() {
-            tracing::debug!(
-                "Active file found {:?}, checking format...",
-                active_file_path
-            );
-
-            let mut read_file = OpenOptions::new()
-                .create(false)
-                .read(true)
-                .truncate(false)
-                .append(false)
-                .open(&active_file_path)?;
-
-            let _ = parse_header(&mut read_file)?;
-
-            let write_file = OpenOptions::new()
-                .create(false)
-                .read(true)
-                .truncate(false)
-                .append(true)
-                .open(&active_file_path)?;
-
-            // TODO: Rebuild self.keydir from existing log files
-            let keydir = HashMap::new();
-
-            Ok(Self {
-                reader: BufReader::new(read_file),
-                writer: BufWriter::new(write_file),
-                keydir: keydir,
-            })
-        } else {
-            tracing::debug!("Active file not found {:?}, creating...", active_file_path);
-
-            let read_file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .truncate(false)
-                .append(true)
-                .open(&active_file_path)?;
-
-            let reader = BufReader::new(read_file);
-
-            let write_file = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .truncate(false)
-                .append(true)
-                .open(&active_file_path)?;
-
-            let mut writer = BufWriter::new(write_file);
-
-            let _ = write_header(&mut writer)?;
-
-            Ok(Self {
-                reader: reader,
-                writer: writer,
-                keydir: HashMap::new(),
-            })
-        }
+        Self::build_database(active_file_path)
     }
 }
 
@@ -306,9 +325,9 @@ mod tests {
         assert!(result.is_ok());
 
         let mut target_buf = Vec::new();
-        target_buf.extend_from_slice(FILE_HEADER_IDENTIFIER);
-        target_buf.extend_from_slice(FILE_HEADER_VERSION);
-        target_buf.extend_from_slice(FILE_HEADER_RESERVED);
+        target_buf.extend_from_slice(FILE_HEADER_IDENTIFIER_BYTES);
+        target_buf.extend_from_slice(FILE_HEADER_VERSION_BYTES);
+        target_buf.extend_from_slice(FILE_HEADER_RESERVED_BYTES);
 
         assert_eq!(buf, target_buf);
     }
@@ -316,15 +335,17 @@ mod tests {
     #[test]
     fn test_parse_header_good_header() {
         let mut data = Vec::new();
-        data.extend_from_slice(FILE_HEADER_IDENTIFIER);
-        data.extend_from_slice(FILE_HEADER_VERSION);
-        data.extend_from_slice(FILE_HEADER_RESERVED);
+        data.extend_from_slice(FILE_HEADER_IDENTIFIER_BYTES);
+        data.extend_from_slice(FILE_HEADER_VERSION_BYTES);
+        data.extend_from_slice(FILE_HEADER_RESERVED_BYTES);
         let mut cursor = Cursor::new(data);
-        let result = parse_header(&mut cursor);
+        let result = parse_file_header(&mut cursor);
 
-        let valid_header = Header {
-            version: u16::from_le_bytes(FILE_HEADER_VERSION.try_into().unwrap()),
-            reserved: FILE_HEADER_RESERVED.try_into().unwrap(),
+        let valid_header = FileHeader {
+            version: FileHeaderVersion(u16::from_le_bytes(
+                FILE_HEADER_VERSION_BYTES.try_into().unwrap(),
+            )),
+            reserved: FileHeaderReserved(FILE_HEADER_RESERVED_BYTES.try_into().unwrap()),
         };
 
         assert!(matches!(result, Ok(valid_header)));
@@ -334,7 +355,7 @@ mod tests {
     fn test_parse_header_too_short() {
         let data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
         let mut cursor = Cursor::new(data);
-        let result = parse_header(&mut cursor);
+        let result = parse_file_header(&mut cursor);
 
         assert!(matches!(result, Err(Error::InvalidHeader)));
     }
@@ -343,7 +364,7 @@ mod tests {
     fn test_parse_header_wrong_sequence() {
         let data = vec![0x00; 42];
         let mut cursor = Cursor::new(data);
-        let result = parse_header(&mut cursor);
+        let result = parse_file_header(&mut cursor);
 
         assert!(matches!(result, Err(Error::InvalidHeader)));
     }
@@ -369,7 +390,8 @@ mod tests {
 
         let flags = 0u8;
 
-        let mut target_buffer = Vec::with_capacity(ENTRY_HEADER_SIZE + key.len() + value.len());
+        let mut target_buffer =
+            Vec::with_capacity(std::mem::size_of::<FileEntryHeader>() + key.len() + value.len());
 
         target_buffer.extend_from_slice(&crc.to_le_bytes());
         target_buffer.extend_from_slice(&timestamp.0.to_le_bytes());
@@ -402,7 +424,8 @@ mod tests {
 
         let flags = 1u8;
 
-        let mut target_buffer = Vec::with_capacity(ENTRY_HEADER_SIZE + key.len());
+        let mut target_buffer =
+            Vec::with_capacity(std::mem::size_of::<FileEntryHeader>() + key.len());
 
         target_buffer.extend_from_slice(&crc.to_le_bytes());
         target_buffer.extend_from_slice(&timestamp.0.to_le_bytes());
