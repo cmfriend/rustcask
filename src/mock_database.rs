@@ -15,7 +15,7 @@ impl Database for MockDatabase {
     }
 
     #[tracing::instrument(skip(self), fields(key = %String::from_utf8_lossy(key)))]
-    fn get(&self, key: &[u8]) -> Result<Vec<u8>, Error> {
+    fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, Error> {
         self.keydir
             .get(key)
             .map(|v| v.clone())
@@ -36,7 +36,7 @@ impl Database for MockDatabase {
 }
 
 impl MockDatabase {
-    pub fn new() -> Self {
+    pub fn open() -> Self {
         Self {
             keydir: HashMap::new(),
         }
