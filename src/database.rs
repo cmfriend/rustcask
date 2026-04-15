@@ -10,6 +10,9 @@ pub trait Database {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Deserialize error: {0}")]
+    DeserializeError(#[from] std::array::TryFromSliceError),
+
     #[error("Provided key was empty")]
     EmptyKey,
 
@@ -21,6 +24,9 @@ pub enum Error {
 
     #[error("Log data file header was not valid")]
     InvalidHeader,
+
+    #[error("Log data file contained invalid entry")]
+    InvalidEntry,
 
     #[error("The provided key was missing")]
     KeyMissing,

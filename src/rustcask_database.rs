@@ -22,6 +22,16 @@ const FILE_HEADER_VERSION_BYTES_OFFSET: usize =
 const FILE_HEADER_RESERVED_BYTES_OFFSET: usize =
     FILE_HEADER_VERSION_BYTES_OFFSET + FILE_HEADER_VERSION_BYTES.len();
 
+const FILE_ENTRY_HEADER_CRC_OFFSET: usize = 0;
+const FILE_ENTRY_HEADER_TIMESTAMP_OFFSET: usize =
+    FILE_ENTRY_HEADER_CRC_OFFSET + std::mem::size_of::<Crc>();
+const FILE_ENTRY_HEADER_KEY_SIZE_OFFSET: usize =
+    FILE_ENTRY_HEADER_TIMESTAMP_OFFSET + std::mem::size_of::<Timestamp>();
+const FILE_ENTRY_HEADER_VALUE_SIZE_OFFSET: usize =
+    FILE_ENTRY_HEADER_KEY_SIZE_OFFSET + std::mem::size_of::<KeySize>();
+const FILE_ENTRY_HEADER_FLAGS_OFFSET: usize =
+    FILE_ENTRY_HEADER_VALUE_SIZE_OFFSET + std::mem::size_of::<ValueSize>();
+
 pub struct RustcaskDatabase {
     reader: BufReader<File>,
     writer: BufWriter<File>,
@@ -122,6 +132,31 @@ struct FileEntryHeader {
 }
 
 impl FileEntryHeader {
+    fn deserialize(le_bytes: [u8; FILE_ENTRY_HEADER_SERIALIZED_SIZE]) -> Result<Self, Error> {
+        Ok(Self {
+            crc: Crc(u32::from_le_bytes(
+                le_bytes[FILE_ENTRY_HEADER_CRC_OFFSET..FILE_ENTRY_HEADER_TIMESTAMP_OFFSET]
+                    .try_into()?,
+            )),
+            timestamp: Timestamp(u64::from_le_bytes(
+                le_bytes[FILE_ENTRY_HEADER_TIMESTAMP_OFFSET..FILE_ENTRY_HEADER_KEY_SIZE_OFFSET]
+                    .try_into()?,
+            )),
+            key_size: KeySize(u32::from_le_bytes(
+                le_bytes[FILE_ENTRY_HEADER_KEY_SIZE_OFFSET..FILE_ENTRY_HEADER_VALUE_SIZE_OFFSET]
+                    .try_into()?,
+            )),
+            value_size: ValueSize(u32::from_le_bytes(
+                le_bytes[FILE_ENTRY_HEADER_VALUE_SIZE_OFFSET..FILE_ENTRY_HEADER_FLAGS_OFFSET]
+                    .try_into()?,
+            )),
+            flags: Flags(u8::from_le_bytes(
+                le_bytes[FILE_ENTRY_HEADER_FLAGS_OFFSET..FILE_ENTRY_HEADER_SERIALIZED_SIZE]
+                    .try_into()?,
+            )),
+        })
+    }
+
     fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(FILE_ENTRY_HEADER_SERIALIZED_SIZE);
 
@@ -251,6 +286,74 @@ impl Database for RustcaskDatabase {
 }
 
 impl RustcaskDatabase {
+    fn rebuild_keydir<R: Read + Seek>(r: &mut R) -> Result<HashMap<Vec<u8>, KeyDirEntry>, Error> {
+        // skip past the file header
+        let _ = r.seek(SeekFrom::Current(FILE_HEADER_SIZE as i64))?;
+
+        let mut keydir = HashMap::new();
+
+        let mut value_offset = FILE_HEADER_SIZE as u64;
+
+        loop {
+            let mut first_byte = [0u8; 1];
+
+            let byte_count = r.read(&mut first_byte)?; // TODO: Need to retry on ErrorKind::Interrupted?
+
+            if byte_count == 0 {
+                break; // clean EOF, no more entries
+            }
+
+            let mut rest = [0u8; FILE_ENTRY_HEADER_SERIALIZED_SIZE - 1];
+            let _ = r.read_exact(&mut rest)?; // UnexpectedEof here means corrupt/truncated
+
+            let header = [&first_byte[..], &rest[..]].concat();
+
+            // Parse entry header
+            let entry = FileEntryHeader::deserialize(header.try_into().unwrap())?;
+
+            // Attempt to read key bytes
+            let mut key_buffer = vec![0u8; entry.key_size.0 as usize];
+            let _ = r.read_exact(&mut key_buffer)?;
+
+            value_offset += FILE_ENTRY_HEADER_SERIALIZED_SIZE as u64 + entry.key_size.0 as u64;
+
+            if entry.flags.0 == 0 {
+                // TODO: Create enum constants for flag values like insert, delete, etc.
+                // Attempt to read value bytes
+                let mut value_buffer = vec![0u8; entry.value_size.0 as usize];
+                let _ = r.read_exact(&mut value_buffer)?;
+
+                // Validate key bytes and value bytes are consistent with crc, return Error if not
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&key_buffer);
+                hasher.update(&value_buffer);
+
+                if hasher.finalize() != entry.crc.0 {
+                    return Err(Error::InvalidEntry); // TODO: Add file info to error to aid troubleshooting
+                }
+
+                // Construct KeyDirEntry with value offset
+                let keydir_entry = KeyDirEntry {
+                    file_id: FileId(ACTIVE_FILE_NAME_ID),
+                    timestamp: entry.timestamp,
+                    value_position: ValuePosition(value_offset as u64),
+                    value_size: entry.value_size,
+                };
+
+                // Add to keydir
+                let _ = keydir.insert(key_buffer, keydir_entry);
+            } else {
+                // Remove from keydir
+                let _ = keydir.remove(&key_buffer);
+            }
+
+            // Increment value offset to next entry
+            value_offset += entry.value_size.0 as u64;
+        }
+
+        Ok(keydir)
+    }
+
     fn build_database(active_file_path: PathBuf) -> Result<Self, Error> {
         let exists = active_file_path.exists();
 
@@ -271,20 +374,20 @@ impl RustcaskDatabase {
         if exists {
             // Check that the header is valid
             let _ = parse_file_header(&mut read_file)?;
-
-            // TODO: Rebuild self.keydir from existing log files
         } else {
             let _ = write_header(&mut write_file)?;
         }
+
+        let keydir = Self::rebuild_keydir(&mut read_file)?;
 
         let reader = BufReader::new(read_file);
 
         let writer = BufWriter::new(write_file);
 
         Ok(Self {
-            reader: reader,
-            writer: writer,
-            keydir: HashMap::new(),
+            reader,
+            writer,
+            keydir,
         })
     }
 
@@ -315,7 +418,7 @@ impl RustcaskDatabase {
 mod tests {
     use super::*;
 
-    use std::io::Cursor;
+    use std::{collections::btree_map::Entry, io::Cursor};
 
     #[test]
     fn test_write_header() {
@@ -437,5 +540,28 @@ mod tests {
         target_buffer.extend_from_slice(&value_bytes);
 
         assert_eq!(buffer, target_buffer);
+    }
+
+    #[test]
+    fn test_rebuild_keydir() {
+        let data: &[u8] = include_bytes!("../tests/fixtures/sample.rustcask");
+        let mut cursor = Cursor::new(data);
+        let keydir = RustcaskDatabase::rebuild_keydir(&mut cursor).unwrap();
+
+        assert_eq!(keydir.len(), 2);
+
+        assert!(keydir.get(b"foo".as_slice()).is_none());
+
+        let abc = keydir.get(b"abc".as_slice()).unwrap();
+        assert_eq!(abc.file_id, FileId(0));
+        assert_eq!(abc.value_size, ValueSize(3));
+        assert_eq!(abc.timestamp, Timestamp(1776294722721));
+        assert_eq!(abc.value_position, ValuePosition(145));
+
+        let ghi = keydir.get(b"ghi".as_slice()).unwrap();
+        assert_eq!(ghi.file_id, FileId(0));
+        assert_eq!(ghi.value_size, ValueSize(3));
+        assert_eq!(ghi.timestamp, Timestamp(1776294290866));
+        assert_eq!(ghi.value_position, ValuePosition(94));
     }
 }
