@@ -15,8 +15,8 @@ This project is under the MIT license.
 | REPL for testing | Yes |
 | Append Only Log Structured Storage | Yes |
 | Log Rotation | No |
-| CRC Validation | No |
-| Startup KeyDir rebuilding | No |
+| CRC Validation | Yes |
+| Startup KeyDir rebuilding | Yes |
 | Log Compaction | No |
 | Hint files | No |
 | Concurrent access | No |
