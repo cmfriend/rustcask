@@ -309,7 +309,7 @@ impl RustcaskDatabase {
             let header = [&first_byte[..], &rest[..]].concat();
 
             // Parse entry header
-            let entry = FileEntryHeader::deserialize(header.try_into().unwrap())?;
+            let entry = FileEntryHeader::deserialize(header.as_slice().try_into()?)?;
 
             // Attempt to read key bytes
             let mut key_buffer = vec![0u8; entry.key_size.0 as usize];
