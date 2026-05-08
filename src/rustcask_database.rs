@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Path, PathBuf}, thread, time::Duration,
 };
 
 use crate::database::*;
@@ -50,7 +50,7 @@ pub struct RustcaskDatabase {
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-struct FileId(u32);
+struct FileId(u64);
 
 impl FileId {
     pub fn next() -> Result<Self, Error> {
@@ -58,7 +58,7 @@ impl FileId {
 
         Ok(FileId(SystemTime::now()
             .duration_since(UNIX_EPOCH)?
-            .as_secs() as u32))
+            .as_millis() as u64))
     }
 }
 
@@ -196,10 +196,7 @@ impl Database for RustcaskDatabase {
                         let read_path = self.path.join(entry.file_id.0.to_string());
                         
                         let read_file = OpenOptions::new()
-                            .create(false)
                             .read(true)
-                            .truncate(false)
-                            .append(false)
                             .open(&read_path)?;
 
                         BufReader::new(read_file)
@@ -279,7 +276,15 @@ impl RustcaskDatabase {
         if writer_len > self.max_file_size_bytes {
             tracing::debug!("File size {writer_len} exceeded limit {}, rotating", self.max_file_size_bytes);
 
-            let next_file_id = FileId::next()?;
+            let mut next_file_id = FileId::next()?;
+
+            // In the unlikely event that the next generated file id is the same as the active one,
+            // sleep a short time and try again
+            while next_file_id == self.active_file_id {
+                thread::sleep(Duration::from_millis(5));
+
+                next_file_id = FileId::next()?;
+            }
 
             self.active_file_id = next_file_id;
 
@@ -288,7 +293,6 @@ impl RustcaskDatabase {
             let mut write_file = OpenOptions::new()
                 .create(true)
                 .read(true)
-                .truncate(false)
                 .append(true)
                 .open(&active_file_path)?;
 
@@ -441,7 +445,7 @@ impl RustcaskDatabase {
             .filter_map(|e| {
                 e.file_name()
                     .to_str()
-                    .and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
                     .map(|n| (n, e.path()))
             })
             .collect();
@@ -451,16 +455,13 @@ impl RustcaskDatabase {
 
         // Read through entries in order and rebuild keydir on each, merging maps together in order
         let mut keydir = HashMap::new();
-        let mut active_file_id = FileId(u32::MIN);
-        for (secs, path) in entries {
+        let mut active_file_id = FileId(u64::MIN);
+        for (millis, path) in entries {
             let mut read_file = OpenOptions::new()
-            .create(false)
             .read(true)
-            .truncate(false)
-            .append(false)
             .open(&path)?;
 
-            let (current_keydir, deletes) = Self::rebuild_keydir(&mut read_file, FileId(secs))?;
+            let (current_keydir, deletes) = Self::rebuild_keydir(&mut read_file, FileId(millis))?;
 
             for key in &deletes {
                 keydir.remove(key);
@@ -468,10 +469,10 @@ impl RustcaskDatabase {
 
             keydir.extend(current_keydir);
 
-            active_file_id = FileId(secs);
+            active_file_id = FileId(millis);
         }
 
-        let db_exists = active_file_id != FileId(u32::MIN);
+        let db_exists = active_file_id != FileId(u64::MIN);
         let active_file_path;
 
         if !db_exists {
@@ -483,7 +484,6 @@ impl RustcaskDatabase {
         let mut write_file = OpenOptions::new()
             .create(!db_exists)
             .read(true)
-            .truncate(false)
             .append(true)
             .open(&active_file_path)?;
 

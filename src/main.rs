@@ -19,7 +19,7 @@ use std::{
 };
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES: &str = "4194304";
+const DEFAULT_RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES: u64 = 4194304;
 
 #[derive(Debug)]
 enum ReplError {
@@ -45,7 +45,7 @@ fn main() -> Result<(), ReplError> {
     #[cfg(feature = "mock")]
     let db = MockDatabase::open();
     #[cfg(not(feature = "mock"))]
-    let db = RustcaskDatabase::open(settings.file_path, settings.max_file_size).map_err(|e| ReplError::DatabaseError(e))?;
+    let db = RustcaskDatabase::open(settings.file_path, settings.rotate_active_file_after_bytes).map_err(|e| ReplError::DatabaseError(e))?;
 
     cmd_loop(db)
 }
@@ -64,12 +64,11 @@ fn load_settings() -> Result<Settings, ReplError> {
         )));
     }
 
-    let max_file_size_env_value = env::var("RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES")
-        .unwrap_or(DEFAULT_RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES.into())
-        .parse::<u64>()
+    let rotate_active_file_after_bytes_env_value = env::var("RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES")
+        .map_or(Ok(DEFAULT_RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES), |v| v.parse::<u64>())
         .expect("RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES did not parse into a u64");
 
-    Ok(Settings::new(file_path, max_file_size_env_value))
+    Ok(Settings::new(file_path, rotate_active_file_after_bytes_env_value))
 }
 
 #[tracing::instrument(skip(db))]

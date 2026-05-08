@@ -34,7 +34,7 @@ Note that at runtime the entire keyspace is maintained in memory so enough memor
 
 The data on disk is organized into files with a capped size that is configurable using the environment variables listed below.  Files are rotated as they reach this size.
 
-The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of seconds since epoch.  The file currently being written is named with the most recent timestamp value.
+The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of milliseconds since epoch.  The file currently being written is named with the most recent timestamp value.
 
 ## Binary Entry File Format
 
