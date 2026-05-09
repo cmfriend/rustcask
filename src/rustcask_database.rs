@@ -2,7 +2,9 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf}, thread, time::Duration,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use crate::database::*;
@@ -56,9 +58,9 @@ impl FileId {
     pub fn next() -> Result<Self, Error> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        Ok(FileId(SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64))
+        Ok(FileId(
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
+        ))
     }
 }
 
@@ -74,16 +76,14 @@ struct Timestamp(u64);
 
 impl Timestamp {
     pub fn get_next_timestamp() -> Result<Self, Error> {
-        Ok(
-            Timestamp(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(Error::TimestampError)?
-                    .as_millis()
-                    .try_into()
-                    .map_err(Error::TimestampOverflow)?
-            )
-        )
+        Ok(Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(Error::TimestampError)?
+                .as_millis()
+                .try_into()
+                .map_err(Error::TimestampOverflow)?,
+        ))
     }
 }
 
@@ -188,20 +188,13 @@ impl Database for RustcaskDatabase {
         let entry = self.keydir.get(key).ok_or(Error::KeyMissing)?;
 
         // Get existing reader or create a new one to the desired file if needed
-        let reader =
-            self.readers
-                .entry(entry.file_id)
-                .or_insert(
-                    {
-                        let read_path = self.path.join(entry.file_id.0.to_string());
-                        
-                        let read_file = OpenOptions::new()
-                            .read(true)
-                            .open(&read_path)?;
+        let reader = self.readers.entry(entry.file_id).or_insert({
+            let read_path = self.path.join(entry.file_id.0.to_string());
 
-                        BufReader::new(read_file)
-                    }
-                );
+            let read_file = OpenOptions::new().read(true).open(&read_path)?;
+
+            BufReader::new(read_file)
+        });
 
         let _ = reader.seek(SeekFrom::Start(entry.value_position.0))?;
 
@@ -274,7 +267,10 @@ impl RustcaskDatabase {
         self.writer.flush()?;
         let writer_len = self.writer.get_ref().metadata()?.len();
         if writer_len > self.max_file_size_bytes {
-            tracing::debug!("File size {writer_len} exceeded limit {}, rotating", self.max_file_size_bytes);
+            tracing::debug!(
+                "File size {writer_len} exceeded limit {}, rotating",
+                self.max_file_size_bytes
+            );
 
             let mut next_file_id = FileId::next()?;
 
@@ -362,7 +358,10 @@ impl RustcaskDatabase {
     }
 
     // Returns keydir hashmap built from r, and a Vec of keys that have been deleted while reading r
-    fn rebuild_keydir<R: Read + Seek>(r: &mut R, file_id: FileId) -> Result<(HashMap<Vec<u8>, KeyDirEntry>, Vec<Vec<u8>>), Error> {
+    fn rebuild_keydir<R: Read + Seek>(
+        r: &mut R,
+        file_id: FileId,
+    ) -> Result<(HashMap<Vec<u8>, KeyDirEntry>, Vec<Vec<u8>>), Error> {
         let _file_header = Self::parse_file_header(r)?;
 
         let mut keydir = HashMap::new();
@@ -455,9 +454,7 @@ impl RustcaskDatabase {
         let mut keydir = HashMap::new();
         let mut active_file_id = FileId(u64::MIN);
         for (millis, path) in entries {
-            let mut read_file = OpenOptions::new()
-            .read(true)
-            .open(&path)?;
+            let mut read_file = OpenOptions::new().read(true).open(&path)?;
 
             let (current_keydir, deletes) = Self::rebuild_keydir(&mut read_file, FileId(millis))?;
 
