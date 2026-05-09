@@ -279,11 +279,9 @@ impl RustcaskDatabase {
             let mut next_file_id = FileId::next()?;
 
             // In the unlikely event that the next generated file id is the same as the active one,
-            // sleep a short time and try again
+            // increment next_file_id to resolve the conflict
             while next_file_id == self.active_file_id {
-                thread::sleep(Duration::from_millis(5));
-
-                next_file_id = FileId::next()?;
+                next_file_id.0 += 1;
             }
 
             self.active_file_id = next_file_id;
