@@ -14,7 +14,7 @@ This project is under the MIT license.
 | --- | --- |
 | REPL for testing | Yes |
 | Append Only Log Structured Storage | Yes |
-| Log Rotation | No |
+| Log Rotation | Yes |
 | CRC Validation | Yes |
 | Startup KeyDir rebuilding | Yes |
 | Log Compaction | No |
@@ -34,7 +34,7 @@ Note that at runtime the entire keyspace is maintained in memory so enough memor
 
 The data on disk is organized into files with a capped size that is configurable using the environment variables listed below.  Files are rotated as they reach this size.
 
-The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of seconds since epoch.  The file currently being written is named `0`.
+The previously stored and compacted files are named `<timestamp>`, where `<timestamp>` is the string representation of milliseconds since epoch.  The file currently being written is named with the most recent timestamp value.
 
 ## Binary Entry File Format
 
@@ -134,7 +134,7 @@ The following environment variables provide configuration values for the databas
 
 #### Optional Environment Variables
 
-`RUSTCASK_MAX_FILE_SIZE_MB` - The maximum file size cap, in MB.  Defaults to 4 MB if not present.
+`RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES` - The number of bytes after which to rotate the active file.  Defaults to 4 MiB if not present.
 
 ## Running the Application
 
@@ -142,7 +142,7 @@ First, configure a local `.env` file to contain the following environment variab
 
 ```
 RUSTCASK_FILE_PATH=<absolute path to file storage for database data>
-RUSTCASK_MAX_FILE_SIZE_MB=<integer file size, in MB>
+RUSTCASK_ROTATE_ACTIVE_FILE_AFTER_BYTES=<integer file size, in bytes>
 RUST_LOG=<log level>
 ```
 

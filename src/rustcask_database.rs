@@ -2,13 +2,10 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::{Path, PathBuf}, thread, time::Duration,
 };
 
 use crate::database::*;
-
-const ACTIVE_FILE_NAME: &str = "0";
-const ACTIVE_FILE_NAME_ID: u32 = 0u32;
 
 const FILE_HEADER_IDENTIFIER_BYTES: &[u8] = b"rustcask";
 const FILE_HEADER_VERSION_BYTES: &[u8] = &[0x01, 0x00];
@@ -33,13 +30,37 @@ const FILE_ENTRY_HEADER_FLAGS_OFFSET: usize =
     FILE_ENTRY_HEADER_VALUE_SIZE_OFFSET + std::mem::size_of::<ValueSize>();
 
 pub struct RustcaskDatabase {
-    reader: BufReader<File>,
+    // Max file size in bytes, after which files will be rotated
+    max_file_size_bytes: u64,
+
+    // Base path storing all Rustcask database files
+    path: PathBuf,
+
+    // Readers of files by FileId
+    readers: HashMap<FileId, BufReader<File>>,
+
+    // FileId of file currently being written to
+    active_file_id: FileId,
+
+    // Writer to active file
     writer: BufWriter<File>,
+
+    // Map of key byte vec to metadata regarding value location in files
     keydir: HashMap<Vec<u8>, KeyDirEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct FileId(u32);
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+struct FileId(u64);
+
+impl FileId {
+    pub fn next() -> Result<Self, Error> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        Ok(FileId(SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis() as u64))
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct ValuePosition(u64);
@@ -50,6 +71,21 @@ struct ValueSize(u32);
 // timestamp in milliseconds since unix epoch
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Timestamp(u64);
+
+impl Timestamp {
+    pub fn get_next_timestamp() -> Result<Self, Error> {
+        Ok(
+            Timestamp(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(Error::TimestampError)?
+                    .as_millis()
+                    .try_into()
+                    .map_err(Error::TimestampOverflow)?
+            )
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct KeyDirEntry {
@@ -151,11 +187,27 @@ impl Database for RustcaskDatabase {
 
         let entry = self.keydir.get(key).ok_or(Error::KeyMissing)?;
 
-        let _ = self.reader.seek(SeekFrom::Start(entry.value_position.0))?;
+        // Get existing reader or create a new one to the desired file if needed
+        let reader =
+            self.readers
+                .entry(entry.file_id)
+                .or_insert(
+                    {
+                        let read_path = self.path.join(entry.file_id.0.to_string());
+                        
+                        let read_file = OpenOptions::new()
+                            .read(true)
+                            .open(&read_path)?;
+
+                        BufReader::new(read_file)
+                    }
+                );
+
+        let _ = reader.seek(SeekFrom::Start(entry.value_position.0))?;
 
         let mut value = vec![0; entry.value_size.0 as usize];
 
-        let _ = self.reader.read_exact(&mut value)?;
+        let _ = reader.read_exact(&mut value)?;
 
         Ok(value)
     }
@@ -170,16 +222,11 @@ impl Database for RustcaskDatabase {
             return Err(Error::EmptyValue);
         }
 
-        let timestamp = Timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(Error::TimestampError)?
-                .as_millis()
-                .try_into()
-                .map_err(Error::TimestampOverflow)?,
-        );
+        let timestamp = Timestamp::get_next_timestamp()?;
 
         let buffer = Self::build_file_entry_buffer(key, value, timestamp);
+
+        let _ = self.maybe_rotate_active_file()?;
 
         let position = self.writer.seek(SeekFrom::End(0))?;
         let _ = self.writer.write_all(&buffer)?;
@@ -190,7 +237,7 @@ impl Database for RustcaskDatabase {
         let _ = self.keydir.insert(
             Vec::from(key),
             KeyDirEntry {
-                file_id: FileId(ACTIVE_FILE_NAME_ID), // using only the active file for now
+                file_id: self.active_file_id,
                 value_position: ValuePosition(value_position),
                 value_size: ValueSize(value.len() as u32),
                 timestamp,
@@ -206,16 +253,11 @@ impl Database for RustcaskDatabase {
             return Err(Error::EmptyKey);
         }
 
-        let timestamp = Timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(Error::TimestampError)?
-                .as_millis()
-                .try_into()
-                .map_err(Error::TimestampOverflow)?,
-        );
+        let timestamp = Timestamp::get_next_timestamp()?;
 
         let buffer = Self::build_file_entry_buffer(key, &Vec::new(), timestamp);
+
+        let _ = self.maybe_rotate_active_file()?;
 
         let _ = self.writer.seek(SeekFrom::End(0))?;
         let _ = self.writer.write_all(&buffer)?;
@@ -228,6 +270,38 @@ impl Database for RustcaskDatabase {
 }
 
 impl RustcaskDatabase {
+    fn maybe_rotate_active_file(&mut self) -> Result<(), Error> {
+        self.writer.flush()?;
+        let writer_len = self.writer.get_ref().metadata()?.len();
+        if writer_len > self.max_file_size_bytes {
+            tracing::debug!("File size {writer_len} exceeded limit {}, rotating", self.max_file_size_bytes);
+
+            let mut next_file_id = FileId::next()?;
+
+            // In the unlikely event that the next generated file id is the same as the active one,
+            // increment next_file_id to resolve the conflict
+            while next_file_id == self.active_file_id {
+                next_file_id.0 += 1;
+            }
+
+            self.active_file_id = next_file_id;
+
+            let active_file_path = self.path.join(self.active_file_id.0.to_string());
+
+            let mut write_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&active_file_path)?;
+
+            let _ = Self::write_header(&mut write_file)?;
+
+            self.writer = BufWriter::new(write_file);
+        }
+
+        Ok(())
+    }
+
     fn write_header(writer: &mut impl Write) -> Result<(), Error> {
         writer.write_all(FILE_HEADER_IDENTIFIER_BYTES)?;
         writer.write_all(FILE_HEADER_VERSION_BYTES)?;
@@ -287,10 +361,13 @@ impl RustcaskDatabase {
         buffer
     }
 
-    fn rebuild_keydir<R: Read + Seek>(r: &mut R) -> Result<HashMap<Vec<u8>, KeyDirEntry>, Error> {
+    // Returns keydir hashmap built from r, and a Vec of keys that have been deleted while reading r
+    fn rebuild_keydir<R: Read + Seek>(r: &mut R, file_id: FileId) -> Result<(HashMap<Vec<u8>, KeyDirEntry>, Vec<Vec<u8>>), Error> {
         let _file_header = Self::parse_file_header(r)?;
 
         let mut keydir = HashMap::new();
+
+        let mut deletes = Vec::new();
 
         let mut value_offset = FILE_HEADER_SIZE as u64;
 
@@ -334,7 +411,7 @@ impl RustcaskDatabase {
 
                 // Construct KeyDirEntry with value offset
                 let keydir_entry = KeyDirEntry {
-                    file_id: FileId(ACTIVE_FILE_NAME_ID),
+                    file_id,
                     timestamp: entry.timestamp,
                     value_position: ValuePosition(value_offset as u64),
                     value_size: entry.value_size,
@@ -345,59 +422,93 @@ impl RustcaskDatabase {
             } else {
                 // Remove from keydir
                 let _ = keydir.remove(&key_buffer);
+
+                // Add to deletes list to remove from keydirs built from other files, in case delete is absent from keydir built here
+                deletes.push(key_buffer);
             }
 
             // Increment value offset to next entry
             value_offset += entry.value_size.0 as u64;
         }
 
-        Ok(keydir)
+        Ok((keydir, deletes))
     }
 
-    fn build_database(active_file_path: PathBuf) -> Result<Self, Error> {
-        let exists = active_file_path.exists();
+    fn build_database(path: &Path, max_file_size_bytes: u64) -> Result<Self, Error> {
+        // Read path to gather all files named as the u32 seconds since unix epoch
+        let entries: Vec<_> = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
 
-        let mut read_file = OpenOptions::new()
-            .create(!active_file_path.exists())
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|n| (n, e.path()))
+            })
+            .collect();
+
+        // Sort files numerically by name so we consume them in chronological order
+        entries.sort_by_key(|&(n, _)| n);
+
+        // Read through entries in order and rebuild keydir on each, merging maps together in order
+        let mut keydir = HashMap::new();
+        let mut active_file_id = FileId(u64::MIN);
+        for (millis, path) in entries {
+            let mut read_file = OpenOptions::new()
             .read(true)
-            .truncate(false)
-            .append(true)
-            .open(&active_file_path)?;
+            .open(&path)?;
 
-        let mut write_file = OpenOptions::new()
-            .create(!active_file_path.exists())
-            .read(true)
-            .truncate(false)
-            .append(true)
-            .open(&active_file_path)?;
+            let (current_keydir, deletes) = Self::rebuild_keydir(&mut read_file, FileId(millis))?;
 
-        let keydir;
+            for key in &deletes {
+                keydir.remove(key);
+            }
 
-        if exists {
-            keydir = Self::rebuild_keydir(&mut read_file)?;
-        } else {
-            let _ = Self::write_header(&mut write_file)?;
-            keydir = HashMap::new();
+            keydir.extend(current_keydir);
+
+            active_file_id = FileId(millis);
         }
 
-        let reader = BufReader::new(read_file);
+        let db_exists = active_file_id != FileId(u64::MIN);
+        let active_file_path;
+
+        if !db_exists {
+            active_file_id = FileId::next()?;
+        }
+
+        active_file_path = path.join(active_file_id.0.to_string());
+
+        let mut write_file = OpenOptions::new()
+            .create(!db_exists)
+            .read(true)
+            .append(true)
+            .open(&active_file_path)?;
+
+        if !db_exists {
+            // Assumes if no active file exists, this is a new directory for a new database
+            // TODO: Implement more robust error handling of directory left in some invalid state, if possible
+
+            let _ = Self::write_header(&mut write_file)?;
+        }
 
         let writer = BufWriter::new(write_file);
 
         Ok(Self {
-            reader,
+            path: path.into(),
+            active_file_id,
+            max_file_size_bytes,
+            readers: HashMap::new(),
             writer,
             keydir,
         })
     }
 
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+    pub fn open(path: impl AsRef<Path>, max_file_size_bytes: u64) -> Result<Self, Error> {
         let path = path.as_ref();
 
-        // It is assumed that `path` contains only rustcask data files.
-        // The files are named either `0` for the current actively written file,
-        // or filenames consisting of a string representation of the unix epoch in seconds,
-        // when that file was created after file rotation.
+        // It is assumed that `path` contains rustcask data files named with the unix epoch timestamp in seconds.
+        // The active file is considered to be the file whose name is the msot recent unix epoch seconds timestamp.
 
         let path_stat = fs::metadata(path)?;
 
@@ -408,9 +519,7 @@ impl RustcaskDatabase {
             )));
         }
 
-        let active_file_path = path.join(ACTIVE_FILE_NAME);
-
-        Self::build_database(active_file_path)
+        Self::build_database(path, max_file_size_bytes)
     }
 }
 
@@ -546,20 +655,23 @@ mod tests {
     fn test_rebuild_keydir() {
         let data: &[u8] = include_bytes!("../tests/fixtures/sample.rustcask");
         let mut cursor = Cursor::new(data);
-        let keydir = RustcaskDatabase::rebuild_keydir(&mut cursor).unwrap();
+        let file_id = FileId(42);
+        let (keydir, deletes) = RustcaskDatabase::rebuild_keydir(&mut cursor, file_id).unwrap();
+
+        assert_eq!(deletes, vec![b"abc".as_slice(), b"foo".as_slice()]);
 
         assert_eq!(keydir.len(), 2);
 
         assert!(keydir.get(b"foo".as_slice()).is_none());
 
         let abc = keydir.get(b"abc".as_slice()).unwrap();
-        assert_eq!(abc.file_id, FileId(0));
+        assert_eq!(abc.file_id, file_id);
         assert_eq!(abc.value_size, ValueSize(3));
         assert_eq!(abc.timestamp, Timestamp(1776294722721));
         assert_eq!(abc.value_position, ValuePosition(145));
 
         let ghi = keydir.get(b"ghi".as_slice()).unwrap();
-        assert_eq!(ghi.file_id, FileId(0));
+        assert_eq!(ghi.file_id, file_id);
         assert_eq!(ghi.value_size, ValueSize(3));
         assert_eq!(ghi.timestamp, Timestamp(1776294290866));
         assert_eq!(ghi.value_position, ValuePosition(94));
