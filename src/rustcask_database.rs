@@ -276,7 +276,7 @@ impl RustcaskDatabase {
 
             // In the unlikely event that the next generated file id is the same as the active one,
             // increment next_file_id to resolve the conflict
-            while next_file_id == self.active_file_id {
+            if next_file_id == self.active_file_id {
                 next_file_id.0 += 1;
             }
 
